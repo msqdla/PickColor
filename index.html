@@ -111,7 +111,7 @@
     </div>
   </div>
 
-  <div class="copied" id="copied"></div>
+  <div class="copied" id="copied">HTML 文件已开始下载，可直接放到你的网页上使用</div>
 
 <script>
 'use strict';
@@ -168,7 +168,7 @@ function loadFile(file) {
   img.src = url;
 }
 
-/* ---------- 核心分析：采样 → 中位切分量化 → 合并相近色 ---------- */
+/* ---------- 核心分析：直方图 → 加权 K-Means 聚类 → 合并 ---------- */
 function analyze(img) {
   const W = 200, H = Math.max(1, Math.round(200 * img.height / img.width));
   const cv = document.createElement('canvas');
@@ -177,81 +177,96 @@ function analyze(img) {
   ctx.drawImage(img, 0, 0, W, H);
   const data = ctx.getImageData(0, 0, W, H).data;
 
-  const pixels = [];
+  /* 1) 5-bit/通道 直方图聚合（大幅减少参与聚类的样本数，速度更快） */
+  const buckets = new Map();
+  let total = 0;
   for (let i = 0; i < data.length; i += 4) {
-    if (data[i + 3] < 128) continue;          // 忽略透明像素
-    pixels.push([data[i], data[i + 1], data[i + 2]]);
+    if (data[i + 3] < 128) continue;                    // 忽略透明像素
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const key = (r >> 5) << 10 | (g >> 5) << 5 | (b >> 5);
+    let e = buckets.get(key);
+    if (!e) { e = { rs: 0, gs: 0, bs: 0, n: 0, r: 0, g: 0, b: 0 }; buckets.set(key, e); }
+    e.rs += r; e.gs += g; e.bs += b; e.n++;
   }
-  if (!pixels.length) throw new Error('图片没有有效像素');
+  if (!buckets.size) throw new Error('图片没有有效像素');
+  const cands = [];
+  const minN = Math.max(6, total / 4000);              // 过滤噪声小桶
+  total = 0; buckets.forEach(e => total += e.n);
+  buckets.forEach(e => {
+    if (e.n >= minN) { e.r = e.rs / e.n; e.g = e.gs / e.n; e.b = e.bs / e.n; cands.push(e); }
+  });
+  if (!cands.length) {                                  // 极端情况兜底：取出现最多的桶
+    [...buckets.values()].sort((a, b) => b.n - a.n).slice(0, 18)
+      .forEach(e => { e.r = e.rs / e.n; e.g = e.gs / e.n; e.b = e.bs / e.n; cands.push(e); });
+  }
 
-  // 中位切分，得到 24 个主色
-  const boxes = medianCut(pixels, 24);
-  let colors = boxes.map(b => {
-    const r = Math.round(b.sum[0] / b.n), g = Math.round(b.sum[1] / b.n), bl = Math.round(b.sum[2] / b.n);
-    return { rgb: [r, g, bl], hex: hexOf(r, g, bl), pct: b.n / pixels.length * 100 };
-  }).sort((a, b) => b.pct - a.pct);
+  /* 2) 最远点采样选种子：保证绿叶/红果/白衬衫等少数派颜色获得独立中心 */
+  let k = Math.min(18, cands.length);
+  let first = cands[0];
+  cands.forEach(e => { if (e.n > first.n) first = e; });
+  const cents = [[first.r, first.g, first.b]];
+  while (cents.length < k) {
+    let best = null, bestD = -1;
+    for (const e of cands) {
+      let d = Infinity;
+      for (const c of cents) d = Math.min(d, dist([e.r, e.g, e.b], c));
+      if (d > bestD) { bestD = d; best = e; }
+    }
+    if (bestD < 30) break;                              // 剩余颜色都足够近就不再加
+    cents.push([best.r, best.g, best.b]);
+  }
+  k = cents.length;
 
-  // 合并相近色（RGB 距离 < 38，按占比加权）
-  const merged = [];
+  /* 3) 加权 Lloyd 迭代（按像素数加权） */
+  let assign = null;
+  for (let it = 0; it < 10; it++) {
+    const sums = cents.map(() => [0, 0, 0, 0]);
+    assign = [];
+    for (const e of cands) {
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < k; i++) {
+        const d = dist([e.r, e.g, e.b], cents[i]);
+        if (d < bd) { bd = d; bi = i; }
+      }
+      assign.push(bi);
+      const s = sums[bi];
+      s[0] += e.r * e.n; s[1] += e.g * e.n; s[2] += e.b * e.n; s[3] += e.n;
+    }
+    let moved = 0;
+    for (let i = 0; i < k; i++) {
+      const s = sums[i];
+      if (!s[3]) { continue; }
+      moved += Math.abs(s[0] / s[3] - cents[i][0]) + Math.abs(s[1] / s[3] - cents[i][1]) + Math.abs(s[2] / s[3] - cents[i][2]);
+      cents[i] = [s[0] / s[3], s[1] / s[3], s[2] / s[3]];
+    }
+    if (moved < 1.5) break;
+  }
+
+  /* 4) 汇总聚类 → 合并相近色 → 归一化 */
+  const cl = cents.map(() => ({ n: 0, rs: 0, gs: 0, bs: 0 }));
+  cands.forEach((e, i) => { const c = cl[assign[i]]; c.n += e.n; c.rs += e.r * e.n; c.gs += e.g * e.n; c.bs += e.b * e.n; });
+  let colors = [];
+  for (const c of cl) {
+    if (!c.n) continue;
+    const r = Math.round(c.rs / c.n), g = Math.round(c.gs / c.n), b = Math.round(c.bs / c.n);
+    colors.push({ rgb: [r, g, b], hex: hexOf(r, g, b), pct: c.n / total * 100 });
+  }
+  colors.sort((a, b) => b.pct - a.pct);
+
+  const merged = [];                                    // 仅合并真正高度相近的
   for (const c of colors) {
-    const m = merged.find(m => dist(m.rgb, c.rgb) < 38);
+    const m = merged.find(m => dist(m.rgb, c.rgb) < 26);
     if (m) {
       const t = m.pct + c.pct;
-      m.rgb = [0, 1, 2].map(k => (m.rgb[k] * m.pct + c.rgb[k] * c.pct) / t);
+      m.rgb = [0, 1, 2].map(i2 => (m.rgb[i2] * m.pct + c.rgb[i2] * c.pct) / t);
       m.pct = t;
       m.hex = hexOf(...m.rgb.map(Math.round));
     } else merged.push({ ...c, rgb: [...c.rgb] });
   }
-  // 占比过小的并入最近的大色
-  const big = merged.filter(c => c.pct >= 1);
-  const small = merged.filter(c => c.pct < 1);
-  for (const s of small) {
-    const near = big.length ? big.reduce((a, b) => dist(a.rgb, s.rgb) < dist(b.rgb, s.rgb) ? a : b)
-                            : s;
-    const t = near.pct + s.pct;
-    near.rgb = [0, 1, 2].map(k => (near.rgb[k] * near.pct + s.rgb[k] * s.pct) / t);
-    near.pct = t;
-    near.hex = hexOf(...near.rgb.map(Math.round));
-  }
-  big.sort((a, b) => b.pct - a.pct);
-  const total = big.reduce((s, c) => s + c.pct, 0);
-  big.forEach(c => c.pct = c.pct / total * 100);
-  return big;
-}
-
-function medianCut(px, k) {
-  let boxes = [{ pixels: px, sum: [0, 0, 0], n: px.length,
-                 min: [0, 0, 0], max: [255, 255, 255] }];
-  const calc = b => {
-    b.sum = [0, 0, 0]; b.n = b.pixels.length;
-    b.min = [255, 255, 255]; b.max = [0, 0, 0];
-    for (const p of b.pixels) for (let c = 0; c < 3; c++) {
-      b.sum[c] += p[c];
-      if (p[c] < b.min[c]) b.min[c] = p[c];
-      if (p[c] > b.max[c]) b.max[c] = p[c];
-    }
-  };
-  boxes.forEach(calc);
-  while (boxes.length < k) {
-    // 挑「像素数 × 通道跨度」最大的盒子切分
-    let bi = -1, bs = -1;
-    boxes.forEach((b, i) => {
-      if (b.n < 2) return;
-      const range = Math.max(...[0, 1, 2].map(c => b.max[c] - b.min[c]));
-      const score = b.n * range;
-      if (score > bs) { bs = score; bi = i; }
-    });
-    if (bi < 0) break;
-    const b = boxes[bi];
-    const ch = [0, 1, 2].reduce((a, c) => (b.max[c] - b.min[c]) > (b.max[a] - b.min[a]) ? c : a, 0);
-    b.pixels.sort((p, q) => p[ch] - q[ch]);
-    const mid = b.n >> 1;
-    const b1 = { pixels: b.pixels.slice(0, mid) };
-    const b2 = { pixels: b.pixels.slice(mid) };
-    calc(b1); calc(b2);
-    boxes.splice(bi, 1, b1, b2);
-  }
-  return boxes;
+  merged.sort((a, b) => b.pct - a.pct);
+  const t2 = merged.reduce((s, c) => s + c.pct, 0);
+  merged.forEach(c => c.pct = c.pct / t2 * 100);
+  return merged;
 }
 
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
@@ -371,11 +386,16 @@ $('btnPng').addEventListener('click', () => {
   const colors = currentColors;
   const cv = document.createElement('canvas');
   const S = 2;                                   // 2 倍清晰度
-  cv.width = 1000 * S; cv.height = 1420 * S;
+  // 图例双列布局，画布高度自适应，保证 3:4 画面 + 全部颜色都显示得下
+  const TW = 675, TH = 900, TY = 130, rowH = 34;
+  const rows = Math.ceil(colors.length / 2);
+  const legendTop = TY + TH + 40;
+  const CH = Math.max(1420, legendTop + rows * rowH + 62);
+  cv.width = 1000 * S; cv.height = CH * S;
   const ctx = cv.getContext('2d');
   ctx.scale(S, S);
   // 背景
-  ctx.fillStyle = '#14120F'; ctx.fillRect(0, 0, 1000, 1420);
+  ctx.fillStyle = '#14120F'; ctx.fillRect(0, 0, 1000, CH);
   // 标题
   ctx.fillStyle = '#EDE6DA'; ctx.textAlign = 'center';
   ctx.font = '600 30px "PingFang SC","Microsoft YaHei",sans-serif';
@@ -383,7 +403,7 @@ $('btnPng').addEventListener('click', () => {
   ctx.fillStyle = '#9A9080'; ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
   ctx.fillText('色块面积 = 该颜色占画面比例 · 3 : 4 画幅', 500, 90);
   // treemap：3:4，宽 675 → 高 900
-  const TW = 675, TH = 900, TX = (1000 - TW) / 2, TY = 130;
+  const TX = (1000 - TW) / 2;
   const blocks = treemap(colors, TW, TH);
   for (const b of blocks) {
     const [r, g, bl] = b.rgb.map(Math.round);
@@ -401,28 +421,31 @@ $('btnPng').addEventListener('click', () => {
   }
   ctx.strokeStyle = 'rgba(255,255,255,.15)';
   ctx.strokeRect(TX - .5, TY - .5, TW + 1, TH + 1);
-  // 图例
-  const LX = 163, LY = TY + TH + 40, rowH = 34, maxPct = colors[0].pct;
+  // 图例：两列（左列按顺序 1,3,5… 右列 2,4,6…，竖向连续更易读）
+  const LX = [100, 520], LY = legendTop, maxPct = colors[0].pct;
   ctx.textAlign = 'left';
-  colors.forEach((c, i) => {
-    const y = LY + i * rowH;
+  const drawItem = (c, x, y) => {
     ctx.fillStyle = c.hex;
-    roundRect(ctx, LX, y, 24, 24, 6); ctx.fill();
+    roundRect(ctx, x, y, 24, 24, 6); ctx.fill();
     ctx.fillStyle = '#EDE6DA'; ctx.font = '14px "SF Mono",Consolas,monospace';
-    ctx.fillText(c.hex, LX + 38, y + 17);
+    ctx.fillText(c.hex, x + 36, y + 17);
     ctx.fillStyle = 'rgba(255,255,255,.08)';
-    roundRect(ctx, LX + 140, y + 9, 400, 7, 3.5); ctx.fill();
+    roundRect(ctx, x + 140, y + 9, 218, 7, 3.5); ctx.fill();
     ctx.fillStyle = c.hex;
-    roundRect(ctx, LX + 140, y + 9, Math.max(7, 400 * c.pct / maxPct), 7, 3.5); ctx.fill();
+    roundRect(ctx, x + 140, y + 9, Math.max(5, 218 * c.pct / maxPct), 7, 3.5); ctx.fill();
     ctx.fillStyle = '#B9AE9C'; ctx.font = '13px "SF Mono",Consolas,monospace';
     ctx.textAlign = 'right';
-    ctx.fillText(c.pct.toFixed(2) + '%', LX + 590, y + 17);
+    ctx.fillText(c.pct.toFixed(2) + '%', x + 388, y + 17);
     ctx.textAlign = 'left';
+  };
+  colors.forEach((c, i) => {
+    const col = i % 2, row = (i / 2) | 0;
+    drawItem(c, LX[col], LY + row * rowH);
   });
   // 底部说明
   ctx.fillStyle = '#8A8072'; ctx.font = '13px "PingFang SC","Microsoft YaHei",sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('基于颜色量化聚类分析 · 相近色已合并 · 占比按像素统计归一化', 500, 1400);
+  ctx.fillText('基于颜色量化聚类分析 · 相近色已合并 · 占比按像素统计归一化', 500, CH - 20);
   // 下载
   const a = document.createElement('a');
   a.download = currentName + '-颜色分布.png';
